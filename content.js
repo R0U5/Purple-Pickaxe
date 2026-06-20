@@ -191,11 +191,15 @@ const DROPS_QUERY = `query($channelID: ID!) {
     viewerDropCampaigns {
       id
       name
+      status
+      startAt
+      endAt
       game { id displayName boxArtURL }
       timeBasedDrops {
         id
         name
         requiredMinutesWatched
+        endAt
         self { currentMinutesWatched isClaimed }
         benefitEdges {
           benefit { id name imageAssetURL }
@@ -215,6 +219,24 @@ const INVENTORY_QUERY = `query {
     }
   }
 }`;
+
+// A drop campaign has ended once Twitch flags it EXPIRED/DELETED or its endAt is
+// in the past. Twitch's viewerDropCampaigns can keep returning a just-ended
+// campaign for a while, and on a page refresh that stale entry would otherwise be
+// cached and re-emitted as a live campaign - surfacing an un-completable drop and
+// driving endless auto-claim retries. Treat such campaigns as gone so we never
+// pick them back up as new. Guard the date parse so an unparseable/absent endAt
+// (or a status field Twitch omits) never falsely marks an active campaign ended.
+function isCampaignEnded(c) {
+  if (!c) return true;
+  const status = typeof c.status === 'string' ? c.status.toUpperCase() : '';
+  if (status === 'EXPIRED' || status === 'DELETED') return true;
+  if (c.endAt) {
+    const end = Date.parse(c.endAt);
+    if (!isNaN(end) && end <= Date.now()) return true;
+  }
+  return false;
+}
 
 // dropId -> { current: <minutes watched>, claimed: <bool>, instanceId: <claimable instance id|null> }
 let inventoryProgress = {};
@@ -437,13 +459,23 @@ async function fetchDropMetadata(channelName) {
     dropCacheTime = Date.now();
     for (const c of campaigns) {
       if (!c.timeBasedDrops?.length) continue;
+      // Skip campaigns that have already ended - never re-cache a stale/expired
+      // campaign as if it were a live one to track.
+      if (isCampaignEnded(c)) {
+        console.log('[Twitch Miner] Skipping ended campaign:', c.name, '| status:', c.status, '| endAt:', c.endAt);
+        continue;
+      }
+      // Drop tiers can expire individually while the campaign is still active.
+      // Drop any tier past its own endAt so a closed tier isn't shown as active.
+      const liveDrops = c.timeBasedDrops.filter(d => !(d.endAt && !isNaN(Date.parse(d.endAt)) && Date.parse(d.endAt) <= Date.now()));
+      if (!liveDrops.length) continue;
       const key = normalizeCampaign(c.name);
       dropCache[key] = {
         id: c.id,
         name: c.name,
         gameName: c.game?.displayName || '',
         gameImage: c.game?.boxArtURL || '',
-        drops: c.timeBasedDrops.map(d => {
+        drops: liveDrops.map(d => {
           const req = d.requiredMinutesWatched || 0;
           const cur = d.self?.currentMinutesWatched ?? 0;
           const claimedFromGql = d.self?.isClaimed === true;
