@@ -743,7 +743,7 @@ async function claimDrop(dropInstanceId) {
   // 1) the persisted query the web client uses, 2) an ad-hoc mutation string.
   const attempts = [
     { name: 'persisted', run: () => gqlPersisted('DropsPage_ClaimDropRewards', CLAIM_DROP_HASH, variables) },
-    { name: 'ad-hoc', run: () => gql('mutation($input: DropsPage_ClaimDropRewardsInput!) { claimDropRewards(input: $input) { status } }', variables) },
+    { name: 'ad-hoc', run: () => gql('mutation($input: ClaimDropRewardsInput!) { claimDropRewards(input: $input) { status } }', variables) },
   ];
 
   let lastErr = 'null response';
