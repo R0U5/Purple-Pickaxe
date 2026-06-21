@@ -227,8 +227,16 @@ function render() {
 
 function updateSessionTime() {
   if (!session) return;
-  const elapsed = Math.floor((Date.now() - session.startTime) / 1000);
-  document.getElementById('sessionTime').textContent = formatDuration(elapsed);
+  // Measure time on the current channel, not since the extension started.
+  // activeChannelAt is stamped when the active channel changes; fall back to
+  // the session start only if we've never set an active channel.
+  const since = session.activeChannel && session.activeChannelAt
+    ? session.activeChannelAt
+    : session.startTime;
+  const el = document.getElementById('sessionTime');
+  if (!since) { el.textContent = '0s'; return; }
+  const elapsed = Math.max(0, Math.floor((Date.now() - since) / 1000));
+  el.textContent = formatDuration(elapsed);
 }
 
 function renderPoints() {

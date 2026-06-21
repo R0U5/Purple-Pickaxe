@@ -388,10 +388,13 @@ async function setActiveChannel(data) {
   if (newChannel && newChannel !== session.activeChannel) {
     session.drops = {};
     session.totalDropsThisSession = 0;
+    // Stamp when this channel session began. Only on an actual channel change -
+    // CHANNEL_ACTIVE also fires on focus pings and re-entry, and the timer must
+    // measure time on the current channel, not be reset by those.
+    session.activeChannelAt = Date.now();
   }
   // Fix 5: Only update activeChannel if non-null
   if (newChannel) session.activeChannel = newChannel;
-  session.activeChannelAt = Date.now();
   await persistSession();
 }
 
