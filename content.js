@@ -1144,41 +1144,53 @@ async function handleUrlChange() {
 // detectDropsFromDOM() (called at bottom) already fetches it. Keeping both
 // was a duplicate that could race.
 
+// Guard against concurrent runs. runPoll is triggered from several sources
+// (the 15s interval, channel navigation, tab focus, the bonus-claim observer),
+// and two overlapping runs could both see the same availableClaim and fire a
+// duplicate claim + POINTS_CLAIMED, miscounting points.
+let pollInFlight = false;
+
 async function runPoll() {
   if (!isContextValid()) { stopPolling(); return; }
   const channel = currentChannel;
   if (!channel) return;
+  if (pollInFlight) return;
+  pollInFlight = true;
 
-  let pollStatus = 'ok';
-  let pollError = null;
-  let pollBalance = null;
+  try {
+    let pollStatus = 'ok';
+    let pollError = null;
+    let pollBalance = null;
 
-  if (!authToken) {
-    try { await fetchAuthToken(); } catch { }
+    if (!authToken) {
+      try { await fetchAuthToken(); } catch { }
+    }
+    if (!authToken) {
+      console.log('[Twitch Miner] No auth token yet, skipping points poll');
+      sendMessage('POLL_STATUS', { status: 'no_auth', error: 'No Twitch auth-token cookie found. Are you logged in?', channel });
+      return;
+    }
+    console.log('[Twitch Miner] Polling: channel=', channel);
+
+    const cpResult = await checkAndClaimChannelPoints(channel);
+    if (cpResult) {
+      pollStatus = cpResult.status;
+      pollError = cpResult.error || null;
+      pollBalance = cpResult.balance;
+    }
+
+    sendMessage('POLL_STATUS', {
+      status: pollStatus,
+      error: pollError,
+      channel,
+      balance: pollBalance,
+    });
+
+    // Also scan drops now - auth is ready and we're already polling points
+    detectDropsFromDOM();
+  } finally {
+    pollInFlight = false;
   }
-  if (!authToken) {
-    console.log('[Twitch Miner] No auth token yet, skipping points poll');
-    sendMessage('POLL_STATUS', { status: 'no_auth', error: 'No Twitch auth-token cookie found. Are you logged in?', channel });
-    return;
-  }
-  console.log('[Twitch Miner] Polling: channel=', channel);
-
-  const cpResult = await checkAndClaimChannelPoints(channel);
-  if (cpResult) {
-    pollStatus = cpResult.status;
-    pollError = cpResult.error || null;
-    pollBalance = cpResult.balance;
-  }
-
-  sendMessage('POLL_STATUS', {
-    status: pollStatus,
-    error: pollError,
-    channel,
-    balance: pollBalance,
-  });
-
-  // Also scan drops now - auth is ready and we're already polling points
-  detectDropsFromDOM();
 }
 
 let pollInterval = null;
@@ -1223,28 +1235,45 @@ async function init() {
   // Fix 3: dropScanLoop starts AFTER auth is available
   dropScanLoop();
 
-  // Detect SPA navigation immediately. Twitch routes via History API
-  // (pushState/replaceState) without full page loads, so hook those plus
-  // popstate to react the moment the channel changes - otherwise the
-  // fallback interval below could delay the first claim by up to 2s.
+  // Detect SPA navigation. Twitch's router runs in the page's MAIN world, so a
+  // content script (isolated world) cannot reliably override its
+  // history.pushState - the override would only intercept calls made from this
+  // isolated world, not the page's own navigations. popstate (back/forward) DOES
+  // cross worlds, so we listen for it; for pushState-based forward navigation we
+  // fall back to a short location poll. 500ms keeps the first claim on a newly
+  // opened channel near-instant without a perceptible delay.
   const checkUrlChange = () => {
     if (window.location.pathname !== lastPath) {
       lastPath = window.location.pathname;
       handleUrlChange();
     }
   };
-  for (const method of ['pushState', 'replaceState']) {
-    const original = history[method];
-    history[method] = function (...args) {
-      const result = original.apply(this, args);
-      checkUrlChange();
-      return result;
-    };
-  }
   window.addEventListener('popstate', checkUrlChange);
+  setInterval(checkUrlChange, 500);
 
-  // Fallback poll in case a navigation slips past the History API hooks.
-  setInterval(checkUrlChange, 2000);
+  // Claim the bonus chest the instant Twitch renders its button, instead of
+  // waiting for the next 15s poll. Mutations are coalesced and throttled so we
+  // never spam GQL; runPoll() routes through the normal claim+record path.
+  setupBonusClaimObserver();
+}
+
+let lastBonusPoll = 0;
+function setupBonusClaimObserver() {
+  let scheduled = false;
+  const observer = new MutationObserver(() => {
+    if (scheduled) return;
+    scheduled = true;
+    setTimeout(() => {
+      scheduled = false;
+      if (!currentChannel) return;
+      if (Date.now() - lastBonusPoll < 5000) return;
+      const btn = document.querySelector('button[aria-label="Claim Bonus"], .claimable-bonus__icon');
+      if (!btn) return;
+      lastBonusPoll = Date.now();
+      runPoll();
+    }, 250);
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 if (document.readyState === 'loading') {
