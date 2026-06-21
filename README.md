@@ -1,3 +1,5 @@
+![Purple Pickaxe](https://github.com/R0U5/Purple-Pickaxe/blob/master/pp.png))
+
 # Purple Pickaxe
 
 **Automatically collect Twitch Channel Points and claim Twitch Drops.**
