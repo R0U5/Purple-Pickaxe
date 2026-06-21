@@ -157,17 +157,6 @@ purple-pickaxe/
 
 ---
 
-## Roadmap
-
-* [ ] Improved statistics dashboard
-* [ ] Twitch campaign calendar
-* [ ] Notifications and reminders
-* [ ] Historical Drop tracking
-* [ ] Optional cloud sync
-* [ ] Multi-account dashboard
-
----
-
 ## Contributing
 
 Issues, suggestions, and pull requests are welcome.
