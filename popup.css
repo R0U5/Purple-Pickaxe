@@ -116,19 +116,19 @@ body {
 .channel-points { font-size: 12px; color: var(--accent); font-weight: 600; }
 .channel-drops { font-size: 12px; color: var(--green); font-weight: 600; }
 
-.drop-campaign { padding: 10px 8px; border-bottom: 1px solid var(--surface2); }
+.drop-campaign { padding: 12px 8px; border-bottom: 1px solid var(--surface2); }
 .drop-campaign:last-child { border-bottom: none; }
-.drop-game { font-weight: 600; font-size: 13px; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
-.drop-game-icon { width: 24px; height: 24px; border-radius: 4px; flex-shrink: 0; object-fit: contain; }
-.drop-campaign-name { font-size: 11px; color: var(--text2); margin-bottom: 6px; }
-.drop-item { padding: 6px 0; font-size: 12px; border-radius: 6px; transition: background .15s; }
+.drop-game { font-weight: 600; font-size: 15px; margin-bottom: 5px; display: flex; align-items: center; gap: 8px; }
+.drop-game-icon { width: 28px; height: 28px; border-radius: 4px; flex-shrink: 0; object-fit: contain; }
+.drop-campaign-name { font-size: 13px; color: var(--text2); margin-bottom: 7px; }
+.drop-item { padding: 8px 0; font-size: 14px; border-radius: 6px; transition: background .15s; }
 .drop-item:hover { background: var(--surface); }
-.drop-header { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
-.drop-icon { width: 20px; height: 20px; border-radius: 4px; flex-shrink: 0; object-fit: contain; }
+.drop-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.drop-icon { width: 24px; height: 24px; border-radius: 4px; flex-shrink: 0; object-fit: contain; }
 .drop-name { flex: 1; color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.drop-pct { font-size: 11px; font-weight: 600; text-align: right; color: var(--gold); }
+.drop-pct { font-size: 13px; font-weight: 600; text-align: right; color: var(--gold); }
 .drop-pct.claimed { color: var(--green); }
-.drop-bar-track { height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+.drop-bar-track { height: 8px; background: var(--surface2); border-radius: 4px; overflow: hidden; }
 .drop-bar-fill { height: 100%; background: var(--accent); border-radius: 3px; }
 .drop-bar-fill.claimed { background: var(--green); }
 .drop-bar-fill.complete { background: var(--gold); }
@@ -139,10 +139,10 @@ body {
 
 /* Claim button - shown on completed (ready-to-claim) drops */
 .drop-claim-btn {
-  margin-top: 6px;
+  margin-top: 7px;
   width: 100%;
-  padding: 6px 8px;
-  font-size: 11px;
+  padding: 8px 10px;
+  font-size: 13px;
   font-weight: 700;
   color: #fff;
   background: var(--accent);
@@ -158,15 +158,15 @@ body {
 .drop-claim-btn.claim-error { background: #7a1f1f; }
 
 /* Campaign-level cumulative progress bar */
-.campaign-bar-row { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; margin-bottom: 3px; }
-.campaign-bar-label { font-size: 10px; color: var(--text2); font-weight: 500; }
-.campaign-bar-pct { font-size: 11px; font-weight: 700; color: var(--accent); }
-.campaign-bar-track { height: 5px; background: var(--surface2); border-radius: 3px; margin-bottom: 8px; }
+.campaign-bar-row { display: flex; justify-content: space-between; align-items: center; margin-top: 7px; margin-bottom: 4px; }
+.campaign-bar-label { font-size: 12px; color: var(--text2); font-weight: 500; }
+.campaign-bar-pct { font-size: 13px; font-weight: 700; color: var(--accent); }
+.campaign-bar-track { height: 7px; background: var(--surface2); border-radius: 4px; margin-bottom: 9px; }
 .campaign-bar-fill { height: 100%; background: var(--accent); border-radius: 3px; }
 .campaign-bar-fill.claimed { background: var(--green); }
 
 /* Per-drop status badges */
-.drop-badge { font-size: 10px; font-weight: 600; padding: 1px 5px; border-radius: 3px; white-space: nowrap; flex-shrink: 0; }
+.drop-badge { font-size: 12px; font-weight: 600; padding: 2px 7px; border-radius: 4px; white-space: nowrap; flex-shrink: 0; }
 .drop-badge-claimed { background: #0a3d1a; color: var(--green); }
 .drop-badge-ready { background: #3d2e0a; color: var(--gold); }
 .drop-badge-active { background: #0a3d1a; color: var(--green); }
