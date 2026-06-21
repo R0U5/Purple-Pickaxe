@@ -591,17 +591,28 @@ function sendMessageAsync(type, data = {}) {
   });
 }
 
-// Cache of channel login -> profile image URL, populated when resolving user IDs.
-const channelAvatars = {};
-
 async function getUserId(login) {
-  const result = await gql('query($login: String!) { user(login: $login) { id profileImageURL(width: 70) } }', { login });
-  const user = result?.data?.user;
-  const id = user?.id || null;
-  if (user?.profileImageURL && login) channelAvatars[login.toLowerCase()] = user.profileImageURL;
+  const result = await gql('query($login: String!) { user(login: $login) { id } }', { login });
+  const id = result?.data?.user?.id || null;
   if (id) console.log('[Twitch Miner] Resolved', login, '->', id);
   else console.log('[Twitch Miner] Failed to resolve user ID for:', login, 'result:', result?.data);
   return id;
+}
+
+// Cache of channel login -> profile image URL. Fetched separately from
+// getUserId so a schema change to profileImageURL can never break channel-ID
+// resolution (which also gates drops). Cached per channel; one extra GQL call
+// the first time we claim on a channel, then served from memory.
+const channelAvatars = {};
+
+async function fetchChannelAvatar(login) {
+  if (!login) return null;
+  const key = login.toLowerCase();
+  if (channelAvatars[key]) return channelAvatars[key];
+  const result = await gql('query($login: String!) { user(login: $login) { profileImageURL(width: 70) } }', { login });
+  const url = result?.data?.user?.profileImageURL || null;
+  if (url) channelAvatars[key] = url;
+  return url;
 }
 
 async function checkAndClaimChannelPoints(channel) {
@@ -645,16 +656,13 @@ async function checkAndClaimChannelPoints(channel) {
 
   console.log('[Twitch Miner] Found claimable points, claimID:', claim.id);
   const balanceBefore = cp.balance;
-  let claimed = false;
 
   if (clickClaimButton()) {
     console.log('[Twitch Miner] Claimed via DOM click');
-    claimed = true;
   } else {
     const claimResult = await claimChannelPoints(channelId, claim.id);
     if (claimResult.ok) {
       console.log('[Twitch Miner] Claimed via GQL mutation');
-      claimed = true;
     } else {
       return { status: 'claim_failed', balance: cp.balance, error: claimResult.error || 'Claim mutation failed' };
     }
@@ -667,7 +675,8 @@ async function checkAndClaimChannelPoints(channel) {
     ? newBalance - balanceBefore
     : 50;
 
-  sendMessage('POINTS_CLAIMED', { amount: delta, channelName: channel, avatar: channelAvatars[channel.toLowerCase()] });
+  const avatar = await fetchChannelAvatar(channel);
+  sendMessage('POINTS_CLAIMED', { amount: delta, channelName: channel, avatar });
   if (newBalance !== null) {
     sendMessage('POINTS_BALANCE', { balance: newBalance, channelName: channel });
   }
@@ -1063,7 +1072,15 @@ function setupTabFocusReporting() {
   window.addEventListener('focus', reportActiveIfFocused);
 }
 
+let raidObserverActive = false;
 function setupRaidDetection() {
+  // Idempotent: document.body persists across Twitch's SPA navigations, so
+  // creating a fresh observer on every channel-entry would leak one per
+  // navigation. Set up a single observer; handleUrlChange resets its state via
+  // window.__twitchMinerResetRaid.
+  if (raidObserverActive) return;
+  raidObserverActive = true;
+
   // Watch for the raid banner overlay that appears when a channel you're
   // watching starts a raid to another channel. Auto-join when detected.
   let raidJoined = false;
@@ -1144,41 +1161,53 @@ async function handleUrlChange() {
 // detectDropsFromDOM() (called at bottom) already fetches it. Keeping both
 // was a duplicate that could race.
 
+// Guard against concurrent runs. runPoll is triggered from several sources
+// (the 15s interval, channel navigation, tab focus, the bonus-claim observer),
+// and two overlapping runs could both see the same availableClaim and fire a
+// duplicate claim + POINTS_CLAIMED, miscounting points.
+let pollInFlight = false;
+
 async function runPoll() {
   if (!isContextValid()) { stopPolling(); return; }
   const channel = currentChannel;
   if (!channel) return;
+  if (pollInFlight) return;
+  pollInFlight = true;
 
-  let pollStatus = 'ok';
-  let pollError = null;
-  let pollBalance = null;
+  try {
+    let pollStatus = 'ok';
+    let pollError = null;
+    let pollBalance = null;
 
-  if (!authToken) {
-    try { await fetchAuthToken(); } catch { }
+    if (!authToken) {
+      try { await fetchAuthToken(); } catch { }
+    }
+    if (!authToken) {
+      console.log('[Twitch Miner] No auth token yet, skipping points poll');
+      sendMessage('POLL_STATUS', { status: 'no_auth', error: 'No Twitch auth-token cookie found. Are you logged in?', channel });
+      return;
+    }
+    console.log('[Twitch Miner] Polling: channel=', channel);
+
+    const cpResult = await checkAndClaimChannelPoints(channel);
+    if (cpResult) {
+      pollStatus = cpResult.status;
+      pollError = cpResult.error || null;
+      pollBalance = cpResult.balance;
+    }
+
+    sendMessage('POLL_STATUS', {
+      status: pollStatus,
+      error: pollError,
+      channel,
+      balance: pollBalance,
+    });
+
+    // Also scan drops now - auth is ready and we're already polling points
+    detectDropsFromDOM();
+  } finally {
+    pollInFlight = false;
   }
-  if (!authToken) {
-    console.log('[Twitch Miner] No auth token yet, skipping points poll');
-    sendMessage('POLL_STATUS', { status: 'no_auth', error: 'No Twitch auth-token cookie found. Are you logged in?', channel });
-    return;
-  }
-  console.log('[Twitch Miner] Polling: channel=', channel);
-
-  const cpResult = await checkAndClaimChannelPoints(channel);
-  if (cpResult) {
-    pollStatus = cpResult.status;
-    pollError = cpResult.error || null;
-    pollBalance = cpResult.balance;
-  }
-
-  sendMessage('POLL_STATUS', {
-    status: pollStatus,
-    error: pollError,
-    channel,
-    balance: pollBalance,
-  });
-
-  // Also scan drops now - auth is ready and we're already polling points
-  detectDropsFromDOM();
 }
 
 let pollInterval = null;
@@ -1223,12 +1252,45 @@ async function init() {
   // Fix 3: dropScanLoop starts AFTER auth is available
   dropScanLoop();
 
-  setInterval(() => {
+  // Detect SPA navigation. Twitch's router runs in the page's MAIN world, so a
+  // content script (isolated world) cannot reliably override its
+  // history.pushState - the override would only intercept calls made from this
+  // isolated world, not the page's own navigations. popstate (back/forward) DOES
+  // cross worlds, so we listen for it; for pushState-based forward navigation we
+  // fall back to a short location poll. 500ms keeps the first claim on a newly
+  // opened channel near-instant without a perceptible delay.
+  const checkUrlChange = () => {
     if (window.location.pathname !== lastPath) {
       lastPath = window.location.pathname;
       handleUrlChange();
     }
-  }, 2000);
+  };
+  window.addEventListener('popstate', checkUrlChange);
+  setInterval(checkUrlChange, 500);
+
+  // Claim the bonus chest the instant Twitch renders its button, instead of
+  // waiting for the next 15s poll. Mutations are coalesced and throttled so we
+  // never spam GQL; runPoll() routes through the normal claim+record path.
+  setupBonusClaimObserver();
+}
+
+let lastBonusPoll = 0;
+function setupBonusClaimObserver() {
+  let scheduled = false;
+  const observer = new MutationObserver(() => {
+    if (scheduled) return;
+    scheduled = true;
+    setTimeout(() => {
+      scheduled = false;
+      if (!currentChannel) return;
+      if (Date.now() - lastBonusPoll < 5000) return;
+      const btn = document.querySelector('button[aria-label="Claim Bonus"], .claimable-bonus__icon');
+      if (!btn) return;
+      lastBonusPoll = Date.now();
+      runPoll();
+    }, 250);
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 if (document.readyState === 'loading') {

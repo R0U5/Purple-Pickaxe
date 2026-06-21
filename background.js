@@ -254,7 +254,7 @@ async function updateCampaignProgress(data) {
   if (!session.drops[campaignId]) {
     session.drops[campaignId] = {
       gameName: sanitizeString(data.gameName),
-      gameImage: sanitizeString(data.gameImage) || '',
+      gameImage: sanitizeUrl(data.gameImage),
       campaignName: sanitizeString(data.campaignName),
       drops: [],
     };
@@ -273,7 +273,7 @@ async function updateCampaignProgress(data) {
   }
   campaign.activeDropIndex = typeof data.activeDropIndex === 'number' ? data.activeDropIndex : -1;
   campaign.gameName = sanitizeString(data.gameName) || campaign.gameName;
-  campaign.gameImage = sanitizeString(data.gameImage) || campaign.gameImage;
+  campaign.gameImage = sanitizeUrl(data.gameImage) || campaign.gameImage;
   campaign.campaignName = sanitizeString(data.campaignName) || campaign.campaignName;
 
   // Replace drops array entirely - no merging. Every CAMPAIGN_PROGRESS
@@ -287,7 +287,7 @@ async function updateCampaignProgress(data) {
     const dropData = {
       id: dropId,
       name: sanitizeString(inc.name),
-      image: sanitizeString(inc.image) || '',
+      image: sanitizeUrl(inc.image),
       requiredSeconds: typeof inc.requiredSeconds === 'number' ? inc.requiredSeconds : 0,
       currentSeconds: typeof inc.currentSeconds === 'number' ? inc.currentSeconds : 0,
       progress: typeof inc.progress === 'number' ? Math.min(Math.max(0, inc.progress), 100) : 0,
@@ -335,7 +335,7 @@ async function recordDropClaim(data) {
   const campaignId = sanitizeId(data.campaignId);
   if (!campaignId) return;
   if (!session.drops[campaignId]) {
-    session.drops[campaignId] = { gameName: sanitizeString(data.gameName), gameImage: sanitizeString(data.gameImage) || '', campaignName: sanitizeString(data.campaignName), drops: [] };
+    session.drops[campaignId] = { gameName: sanitizeString(data.gameName), gameImage: sanitizeUrl(data.gameImage), campaignName: sanitizeString(data.campaignName), drops: [] };
   }
   const campaign = session.drops[campaignId];
   const dropId = sanitizeId(data.dropId);
@@ -346,12 +346,13 @@ async function recordDropClaim(data) {
     campaign.drops[existing].status = 'claimed';
     campaign.drops[existing].claimedAt = Date.now();
     campaign.drops[existing].progress = 100;
-    if (data.dropImage) campaign.drops[existing].image = sanitizeString(data.dropImage);
+    const cleanImg = sanitizeUrl(data.dropImage);
+    if (cleanImg) campaign.drops[existing].image = cleanImg;
   } else {
     campaign.drops.push({
       id: dropId,
       name: sanitizeString(data.dropName),
-      image: sanitizeString(data.dropImage) || '',
+      image: sanitizeUrl(data.dropImage),
       required: typeof data.required === 'number' ? data.required : 100,
       progress: 100,
       status: 'claimed',
