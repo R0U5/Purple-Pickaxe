@@ -7,7 +7,72 @@ chrome.runtime.onInstalled.addListener(() => {
   initSession();
 });
 
-initSession();
+initSession().then(() => reevaluateActiveChannel());
+
+// Single-segment Twitch paths that are not channel pages (mirrors content.js).
+const NON_CHANNEL_PATHS = new Set([
+  'search', 'directory', 'following', 'subscriptions', 'downloads',
+  'prime', 'store', 'drops', 'wallet', 'inventory', 'settings',
+  'jobs', 'turbo', 'bits', 'moderator', 'friends', 'notifications',
+]);
+
+function isChannelUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname !== 'www.twitch.tv') return false;
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (parts.length !== 1) return false;
+    return !NON_CHANNEL_PATHS.has(parts[0].toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+// Reset all per-channel session state. Centralized so the badge, timer, drops
+// and per-visit points all clear together wherever a channel session ends.
+function endChannelSession(session) {
+  session.activeChannel = null;
+  session.activeChannelAt = 0;
+  session.activeChannelTabId = null;
+  session.currentChannelPoints = 0;
+  session.drops = {};
+  session.totalDropsThisSession = 0;
+}
+
+// End the channel session when no open tab is on a Twitch channel page, so the
+// badge and popup stop showing stale points. This covers tab close/navigation,
+// where a destroyed content script can't send CHANNEL_INACTIVE itself.
+async function reevaluateActiveChannel() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: '*://www.twitch.tv/*' });
+  } catch {
+    return;
+  }
+  if (tabs.some(t => isChannelUrl(t.url))) return;
+  const session = await getSessionData();
+  if (session.activeChannel) {
+    endChannelSession(session);
+    await persistSession();
+  }
+}
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  // If the closed tab owned the active channel, end the session right away so
+  // the badge doesn't keep showing a closed channel's points while other
+  // channel tabs remain. A remaining tab re-asserts itself when next focused.
+  const session = await getSessionData();
+  if (session.activeChannel && session.activeChannelTabId === tabId) {
+    endChannelSession(session);
+    await persistSession();
+    return;
+  }
+  reevaluateActiveChannel();
+});
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  // A url change means a tab navigated - re-check whether any channel remains.
+  if (changeInfo.url) reevaluateActiveChannel();
+});
 
 function isValidOrigin(sender) {
   return sender.id === chrome.runtime.id;
@@ -71,7 +136,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
     case 'CHANNEL_ACTIVE':
       // Fix 2: Acknowledge so content.js can sequence polls after channel set
-      setActiveChannel(message.data).then(() => sendResponse({ ok: true }));
+      setActiveChannel(message.data, sender.tab?.id).then(() => sendResponse({ ok: true }));
       return true;
     case 'CHANNEL_INACTIVE':
       // Left a channel (navigated to a non-channel page). Ends the channel
@@ -157,6 +222,8 @@ function createNewSession() {
     totalDropsThisSession: 0,
     activeChannel: null,
     activeChannelAt: 0,
+    activeChannelTabId: null,
+    currentChannelPoints: 0,
   };
   return persistSession();
 }
@@ -186,8 +253,10 @@ function persistSession() {
 }
 
 function updateBadge(session) {
-  const key = session.activeChannel ? session.activeChannel.toLowerCase() : null;
-  const pts = key ? (session.points[key]?.total || 0) : 0;
+  // Show only the points claimed on the current channel during this visit, and
+  // nothing when there's no active channel. currentChannelPoints resets on
+  // every channel change, so the badge reflects "this channel, right now".
+  const pts = session.activeChannel ? (session.currentChannelPoints || 0) : 0;
   const text = pts > 0 ? formatNum(pts) : '';
   chrome.action.setBadgeText({ text });
   chrome.action.setBadgeBackgroundColor({ color: '#9146ff' });
@@ -212,6 +281,12 @@ async function recordPointClaim(data, tabId) {
   session.points[key].lastSeen = Date.now();
   const cleanAvatar = sanitizeUrl(data.avatar);
   if (cleanAvatar) session.points[key].avatar = cleanAvatar;
+
+  // Per-visit counter for the badge/current-channel stat: only count claims on
+  // the channel currently active (focused), so the badge tracks "this channel".
+  if (session.activeChannel && key === session.activeChannel.toLowerCase()) {
+    session.currentChannelPoints = (session.currentChannelPoints || 0) + amount;
+  }
 
   if (!session.recentChannels) session.recentChannels = [];
   const idx = session.recentChannels.indexOf(key);
@@ -387,20 +462,27 @@ async function updatePointsBalance(data) {
 // Fix 2: Atomic channel-change drop clear - if the new channel differs,
 // wipe drops and reset the session counter under the same async lock.
 // No more fire-and-forget CLEAR_DROPS race from content.js.
-async function setActiveChannel(data) {
+async function setActiveChannel(data, tabId) {
   const session = await getSessionData();
   const newChannel = sanitizeString(data.channel) || null;
   // Fix 5: Only clear when switching to a real (non-null) channel
   if (newChannel && newChannel !== session.activeChannel) {
     session.drops = {};
     session.totalDropsThisSession = 0;
+    // Reset the per-visit points so the badge/stat restart for the new channel.
+    session.currentChannelPoints = 0;
     // Stamp when this channel session began. Only on an actual channel change -
     // CHANNEL_ACTIVE also fires on focus pings and re-entry, and the timer must
     // measure time on the current channel, not be reset by those.
     session.activeChannelAt = Date.now();
   }
   // Fix 5: Only update activeChannel if non-null
-  if (newChannel) session.activeChannel = newChannel;
+  if (newChannel) {
+    session.activeChannel = newChannel;
+    // Remember which tab owns the active channel so closing that exact tab can
+    // end the session even when other channel tabs remain open.
+    if (typeof tabId === 'number') session.activeChannelTabId = tabId;
+  }
   await persistSession();
 }
 
@@ -411,10 +493,7 @@ async function clearActiveChannel(data) {
   const session = await getSessionData();
   const left = sanitizeString(data?.channel);
   if (left && left === session.activeChannel) {
-    session.activeChannel = null;
-    session.activeChannelAt = 0;
-    session.drops = {};
-    session.totalDropsThisSession = 0;
+    endChannelSession(session);
     await persistSession();
   }
 }
