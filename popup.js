@@ -275,7 +275,7 @@ function renderPoints() {
     const pts = item.appendChild(document.createElement('div'));
     pts.className = 'channel-points';
     const total = p.total || 0;
-    pts.textContent = p.count > 1 ? `+${total.toLocaleString()} (${p.count}x)` : `+${total.toLocaleString()}`;
+    pts.textContent = `+${total.toLocaleString()}`;
   }
 }
 
