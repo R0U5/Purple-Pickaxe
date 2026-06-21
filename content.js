@@ -194,7 +194,7 @@ const DROPS_QUERY = `query($channelID: ID!) {
       status
       startAt
       endAt
-      game { id displayName boxArtURL }
+      game { id displayName boxArtURL(width: 48, height: 64) }
       timeBasedDrops {
         id
         name
