@@ -591,17 +591,28 @@ function sendMessageAsync(type, data = {}) {
   });
 }
 
-// Cache of channel login -> profile image URL, populated when resolving user IDs.
-const channelAvatars = {};
-
 async function getUserId(login) {
-  const result = await gql('query($login: String!) { user(login: $login) { id profileImageURL(width: 70) } }', { login });
-  const user = result?.data?.user;
-  const id = user?.id || null;
-  if (user?.profileImageURL && login) channelAvatars[login.toLowerCase()] = user.profileImageURL;
+  const result = await gql('query($login: String!) { user(login: $login) { id } }', { login });
+  const id = result?.data?.user?.id || null;
   if (id) console.log('[Twitch Miner] Resolved', login, '->', id);
   else console.log('[Twitch Miner] Failed to resolve user ID for:', login, 'result:', result?.data);
   return id;
+}
+
+// Cache of channel login -> profile image URL. Fetched separately from
+// getUserId so a schema change to profileImageURL can never break channel-ID
+// resolution (which also gates drops). Cached per channel; one extra GQL call
+// the first time we claim on a channel, then served from memory.
+const channelAvatars = {};
+
+async function fetchChannelAvatar(login) {
+  if (!login) return null;
+  const key = login.toLowerCase();
+  if (channelAvatars[key]) return channelAvatars[key];
+  const result = await gql('query($login: String!) { user(login: $login) { profileImageURL(width: 70) } }', { login });
+  const url = result?.data?.user?.profileImageURL || null;
+  if (url) channelAvatars[key] = url;
+  return url;
 }
 
 async function checkAndClaimChannelPoints(channel) {
@@ -645,16 +656,13 @@ async function checkAndClaimChannelPoints(channel) {
 
   console.log('[Twitch Miner] Found claimable points, claimID:', claim.id);
   const balanceBefore = cp.balance;
-  let claimed = false;
 
   if (clickClaimButton()) {
     console.log('[Twitch Miner] Claimed via DOM click');
-    claimed = true;
   } else {
     const claimResult = await claimChannelPoints(channelId, claim.id);
     if (claimResult.ok) {
       console.log('[Twitch Miner] Claimed via GQL mutation');
-      claimed = true;
     } else {
       return { status: 'claim_failed', balance: cp.balance, error: claimResult.error || 'Claim mutation failed' };
     }
@@ -667,7 +675,8 @@ async function checkAndClaimChannelPoints(channel) {
     ? newBalance - balanceBefore
     : 50;
 
-  sendMessage('POINTS_CLAIMED', { amount: delta, channelName: channel, avatar: channelAvatars[channel.toLowerCase()] });
+  const avatar = await fetchChannelAvatar(channel);
+  sendMessage('POINTS_CLAIMED', { amount: delta, channelName: channel, avatar });
   if (newBalance !== null) {
     sendMessage('POINTS_BALANCE', { balance: newBalance, channelName: channel });
   }
@@ -1063,7 +1072,15 @@ function setupTabFocusReporting() {
   window.addEventListener('focus', reportActiveIfFocused);
 }
 
+let raidObserverActive = false;
 function setupRaidDetection() {
+  // Idempotent: document.body persists across Twitch's SPA navigations, so
+  // creating a fresh observer on every channel-entry would leak one per
+  // navigation. Set up a single observer; handleUrlChange resets its state via
+  // window.__twitchMinerResetRaid.
+  if (raidObserverActive) return;
+  raidObserverActive = true;
+
   // Watch for the raid banner overlay that appears when a channel you're
   // watching starts a raid to another channel. Auto-join when detected.
   let raidJoined = false;
