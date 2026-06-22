@@ -126,11 +126,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'DROP_CLAIMED':
       recordDropClaim(message.data);
       break;
-    case 'CLAIM_DROP':
-      // Relay a popup claim request into a Twitch page so the GQL claim runs
-      // from a trusted www.twitch.tv origin. Async - keep the channel open.
-      claimDropViaContent(message.data).then(sendResponse);
-      return true;
     case 'POINTS_BALANCE':
       updatePointsBalance(message.data);
       break;
@@ -512,40 +507,4 @@ async function setPollStatus(data) {
 
 async function resetSession() {
   await createNewSession();
-}
-
-// Relay a claim request to the content script in an open Twitch tab. The claim
-// GQL must originate from the www.twitch.tv page context (the extension/service
-// worker origin is rejected by Twitch), so we forward to each Twitch tab until
-// one reports success.
-async function claimDropViaContent(data) {
-  let tabs = [];
-  try {
-    tabs = await chrome.tabs.query({ url: '*://www.twitch.tv/*' });
-  } catch (err) {
-    return { ok: false, error: 'Could not query tabs: ' + (err?.message || err) };
-  }
-  if (!tabs.length) {
-    return { ok: false, error: 'No open Twitch tab - open twitch.tv to claim from here.' };
-  }
-
-  const payload = {
-    campaignId: sanitizeId(data.campaignId),
-    dropId: sanitizeId(data.dropId),
-    dropInstanceId: sanitizeInstanceId(data.dropInstanceId),
-    dropName: sanitizeString(data.dropName),
-  };
-
-  let lastError = 'No Twitch tab could claim this drop';
-  for (const tab of tabs) {
-    try {
-      const res = await chrome.tabs.sendMessage(tab.id, { type: 'CLAIM_DROP_REQUEST', data: payload });
-      if (res && res.ok) return { ok: true };
-      if (res && res.error) lastError = res.error;
-    } catch (err) {
-      // Tab without a live content script (e.g. still loading) - try the next.
-      lastError = err?.message || lastError;
-    }
-  }
-  return { ok: false, error: lastError };
 }
