@@ -3,11 +3,35 @@ const STORAGE_KEY = 'twitchMinerSession';
 let cachedSession = null;
 let savePromise = null;
 
-chrome.runtime.onInstalled.addListener(() => {
-  initSession();
-});
+// Serialize session bootstrapping so the service-worker-start load and any
+// fresh-session reset (browser launch / install) can't race each other.
+let bootPromise = Promise.resolve();
+let freshBooted = false;
 
-initSession().then(() => reevaluateActiveChannel());
+function boot(fresh) {
+  bootPromise = bootPromise.then(async () => {
+    if (fresh) {
+      // New browser session or install/update: wipe everything, including the
+      // points history, so each session starts with a clean slate.
+      freshBooted = true;
+      await createNewSession();
+      return;
+    }
+    // Service-worker (re)start mid-session. MV3 workers spin down when idle and
+    // restart on events, so this fires often - we must keep accumulated points
+    // here and only drop the ephemeral drops. Skip if a fresh boot already ran
+    // in this worker lifetime.
+    if (freshBooted) return;
+    await initSession();
+  });
+  return bootPromise;
+}
+
+// Every service-worker start (covers mid-session restarts).
+boot(false).then(() => reevaluateActiveChannel());
+// Fires only on a genuine new browser session / install/update → clean slate.
+chrome.runtime.onStartup.addListener(() => boot(true));
+chrome.runtime.onInstalled.addListener(() => boot(true));
 
 // Single-segment Twitch paths that are not channel pages (mirrors content.js).
 const NON_CHANNEL_PATHS = new Set([
@@ -227,6 +251,8 @@ function createNewSession() {
 }
 
 async function getSessionData() {
+  // Ensure session bootstrap (load or fresh reset) has settled before use.
+  try { await bootPromise; } catch {}
   if (cachedSession) {
     migrateSession(cachedSession);
     return cachedSession;
