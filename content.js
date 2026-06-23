@@ -31,7 +31,6 @@ let lastIntegrityFetch = 0;
 // ── Module-level claimed state ──
 // Persist across scrape interval cycles; reset on channel change.
 const claimedDropIds = new Set();
-const claimedFallbackKeys = new Set();
 
 // ── Fix 9: Prevent concurrent fetchDropMetadata calls ──
 let fetchDropMetadataInFlight = false;
@@ -385,65 +384,8 @@ function buildCampaignState(cached) {
   };
 }
 
-// ── DOM progress scraper ──
-// Reads what Twitch actually displays, used when GQL shows 0 but DOM shows real progress.
-function scrapeDomDropProgress(container) {
-  if (!container) return null;
-
-  // Strategy 1: aria progressbar (standard Twitch widget)
-  const bar = container.querySelector('[role="progressbar"]');
-  if (bar) {
-    const vn = parseInt(bar.getAttribute('aria-valuenow'), 10);
-    const vm = parseInt(bar.getAttribute('aria-valuemax'), 10);
-    if (!isNaN(vn) && !isNaN(vm) && vm > 0) {
-      return { current: vn, max: vm, percent: Math.round((vn / vm) * 100) };
-    }
-  }
-
-  // Strategy 2: percentage text (e.g. "80% complete", "75% of")
-  const text = (container.innerText || '').replace(/[\u200B-\u200D\uFEFF]/g, '');
-  const pctMatch = text.match(/(\d+)%/);
-  if (pctMatch) {
-    return { percent: parseInt(pctMatch[1], 10) };
-  }
-
-  // Strategy 3: fraction text (e.g. "48 / 60 minutes")
-  const fracMatch = text.match(/(\d+)\s*\/\s*(\d+)\s*(?:min|hr|hour)/i);
-  if (fracMatch) {
-    const cur = parseInt(fracMatch[1], 10);
-    const max = parseInt(fracMatch[2], 10);
-    if (max > 0) return { current: cur, max: max, percent: Math.round((cur / max) * 100) };
-  }
-
-  return null;
-}
-
 function normalizeCampaign(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '');
-}
-
-// ── Strict campaign matching ──
-// Contains + length-diff ≤ 6 gate. Multiple candidates → closest by character
-// difference, or null if tied.
-function matchCampaign(domKey, cache) {
-  if (!domKey) return null;
-  if (cache[domKey]) return cache[domKey];
-
-  const candidates = [];
-  for (const [key, val] of Object.entries(cache)) {
-    if ((key.includes(domKey) || domKey.includes(key)) &&
-        Math.abs(key.length - domKey.length) <= 6) {
-      candidates.push({ key, val, diff: Math.abs(key.length - domKey.length) });
-    }
-  }
-
-  if (candidates.length === 0) return null;
-  if (candidates.length === 1) return candidates[0].val;
-
-  // Multiple candidates - return closest by character difference, or null if tied
-  candidates.sort((a, b) => a.diff - b.diff);
-  if (candidates[0].diff === candidates[1].diff) return null;
-  return candidates[0].val;
 }
 
 // ── Fetch drop metadata via GQL ──
@@ -475,9 +417,6 @@ async function fetchDropMetadata(channelName) {
       return;
     }
 
-    // Fix 4: CLEAR_DROPS removed from here - setActiveChannel atomic clear
-    // handles the stale dom-* orphan problem.
-
     dropCache = {};
     dropCacheChannel = channelName;
     dropCacheTime = Date.now();
@@ -498,6 +437,7 @@ async function fetchDropMetadata(channelName) {
       dropCache[key] = {
         id: c.id,
         name: c.name,
+        endAt: c.endAt || null,
         gameName: c.game?.displayName || '',
         gameImage: c.game?.boxArtURL || '',
         drops: liveDrops.map(d => {
@@ -559,14 +499,10 @@ async function fetchInventory() {
 function restoreClaimedFlags() {
   chrome.runtime.sendMessage({ type: 'GET_SESSION' }, (response) => {
     if (!response?.drops) return;
-    for (const [campaignId, campaign] of Object.entries(response.drops)) {
+    for (const campaign of Object.values(response.drops)) {
       // Restore claimed flags for individual drops
       for (const drop of (campaign.drops || [])) {
         if (drop.claimed) claimedDropIds.add(drop.id);
-      }
-      // Restore fallback-claimed flag for campaigns with dom-* IDs
-      if (campaignId.startsWith('dom-') && campaign.drops?.some(d => d.claimed)) {
-        claimedFallbackKeys.add(campaignId.slice(4));
       }
     }
   });
@@ -813,6 +749,9 @@ async function detectDropsFromDOM() {
   const supplemented = [];
   if (hasCache) {
     for (const cached of Object.values(dropCache)) {
+      // Drop campaigns that ended mid-session, checked every scan so the window
+      // updates promptly instead of waiting for the next metadata refetch.
+      if (cached.endAt && !isNaN(Date.parse(cached.endAt)) && Date.parse(cached.endAt) <= Date.now()) continue;
       const campaign = buildCampaignState(cached);
       if (!campaign || !campaign.drops.length) continue;
 
@@ -843,6 +782,12 @@ async function detectDropsFromDOM() {
       })),
     });
   }
+
+  // ── Reconcile displayed campaigns with what's live ──
+  // Tell the background the full set of currently-live campaign ids so it can
+  // drop ones that ended or are no longer returned by GQL. Sent before the
+  // claim logic (which can early-return) so it runs every scan.
+  sendMessage('CAMPAIGN_SNAPSHOT', { liveIds: supplemented.map(c => c.id) });
 
   // ── Claim detection (debounced) ──
   // Do NOT early-return when the highlight banner is absent. GQL auto-claim
@@ -961,73 +906,6 @@ async function detectDropsFromDOM() {
     }
     return;
   }
-
-  // Fallback: no GQL data - use DOM progress bar (requires the highlight DOM)
-  if (!hasCache && domContainer) {
-    const progressBar = domContainer.querySelector('[role="progressbar"].tw-progress-bar');
-    if (!progressBar) return;
-    const highlightEl = domContainer.querySelector('[class*="dropsHighlight"]');
-    const lines = (highlightEl?.innerText || '').split('\n').map(l => l.trim()).filter(Boolean);
-    const domName = lines[1] || lines[0] || '';
-    const domKey = normalizeCampaign(domName);
-
-    // Use claimedFallbackKeys Set instead of window flag
-    if (claimedFallbackKeys.has(domKey)) return;
-
-    const valuenow = parseInt(progressBar.getAttribute('aria-valuenow'), 10);
-    const valuemaxAttr = parseInt(progressBar.getAttribute('aria-valuemax'), 10);
-    const hasRealMax = !isNaN(valuemaxAttr) && valuemaxAttr > 0;
-    const valuemax = hasRealMax ? valuemaxAttr : 100;
-    if (!isNaN(valuenow) && valuemax > 0) {
-      const fallbackProgress = Math.min(100, Math.max(0, Math.round((valuenow / valuemax) * 100)));
-      const fallbackId = domKey ? 'dom-' + domKey.slice(0, 48) : 'dom-unknown';
-
-      // Twitch's drop progress bar reports watched/required MINUTES in its aria
-      // attributes. The downstream fields are in seconds, so convert. When
-      // aria-valuemax is absent we only have a percentage (valuemax defaulted to
-      // 100), so emit 0 for the absolute times and let the popup show % only
-      // rather than display a wrong duration like "60s" for an hour-long drop.
-      const reqSecs = hasRealMax ? valuemax * 60 : 0;
-      const curSecs = hasRealMax ? valuenow * 60 : 0;
-
-      sendMessage('CAMPAIGN_PROGRESS', {
-        campaignId: fallbackId,
-        campaignName: domName || 'Unknown Drop',
-        gameName: currentChannel || 'Unknown',
-        gameImage: '',
-        campaignProgress: fallbackProgress,
-        totalRequiredSeconds: reqSecs,
-        totalEarnedSeconds: curSecs,
-        activeDropIndex: 0,
-        drops: [{
-          id: fallbackId + '-drop0',
-          name: domName || 'Unknown Drop',
-          image: '',
-          requiredSeconds: reqSecs,
-          currentSeconds: curSecs,
-          progress: fallbackProgress,
-          status: fallbackProgress >= 100 ? 'complete' : 'active',
-        }],
-      });
-
-      if (claimBtn && canAttemptClaim(fallbackId + '-drop0')) {
-        claimState.inProgress = true;
-        console.log('[Twitch Miner] Drop ready - auto-claiming via DOM button (fallback)');
-        claimedFallbackKeys.add(domKey);
-        // 500ms delay before clicking
-        await new Promise(r => setTimeout(r, 500));
-        claimBtn.click();
-        sendMessage('DROP_CLAIMED', {
-          campaignId: fallbackId,
-          dropId: fallbackId + '-drop0',
-          dropName: domName || '',
-          gameImage: '',
-          dropImage: '',
-        });
-        recordClaimAttempt(fallbackId + '-drop0', true);
-      }
-    }
-  }
 }
 
 // ── Tab-focus reporting ──
@@ -1115,7 +993,6 @@ async function handleUrlChange() {
 
   // Clear claimed Sets synchronously before async repopulation
   claimedDropIds.clear();
-  claimedFallbackKeys.clear();
   completeSince.clear();
   restoreClaimedFlags();
 

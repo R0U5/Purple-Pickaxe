@@ -123,6 +123,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'CAMPAIGN_PROGRESS':
       updateCampaignProgress(message.data);
       break;
+    case 'CAMPAIGN_SNAPSHOT':
+      reconcileCampaigns(message.data);
+      break;
     case 'DROP_CLAIMED':
       recordDropClaim(message.data);
       break;
@@ -404,6 +407,31 @@ async function updateCampaignProgress(data) {
   campaign.drops = newDrops;
 
   await persistSession();
+}
+
+// Prune campaigns the content script no longer reports as live (ended or no
+// longer returned by GQL), so the drops window reflects reality. Campaigns with
+// a drop claimed this session are kept so earned rewards stay visible.
+async function reconcileCampaigns(data) {
+  const session = await getSessionData();
+  // Only act on the active channel - ignore late snapshots from a previous one.
+  const incomingChannel = sanitizeString(data.channelName);
+  if (incomingChannel && session.activeChannel && incomingChannel !== session.activeChannel) return;
+
+  const liveIds = new Set((Array.isArray(data.liveIds) ? data.liveIds : []).map(sanitizeId).filter(Boolean));
+  let changed = false;
+  for (const [id, campaign] of Object.entries(session.drops || {})) {
+    if (liveIds.has(id)) continue;
+    const hasClaim = (campaign.drops || []).some(d => d.claimed);
+    if (hasClaim) continue;
+    delete session.drops[id];
+    changed = true;
+  }
+  if (changed) {
+    session.totalDropsThisSession = Object.values(session.drops)
+      .reduce((sum, c) => sum + (c.drops || []).filter(d => d.claimed).length, 0);
+    await persistSession();
+  }
 }
 
 async function recordDropClaim(data) {
