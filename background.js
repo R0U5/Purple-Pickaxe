@@ -123,14 +123,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'CAMPAIGN_PROGRESS':
       updateCampaignProgress(message.data);
       break;
+    case 'CAMPAIGN_SNAPSHOT':
+      reconcileCampaigns(message.data);
+      break;
     case 'DROP_CLAIMED':
       recordDropClaim(message.data);
       break;
-    case 'CLAIM_DROP':
-      // Relay a popup claim request into a Twitch page so the GQL claim runs
-      // from a trusted www.twitch.tv origin. Async - keep the channel open.
-      claimDropViaContent(message.data).then(sendResponse);
-      return true;
     case 'POINTS_BALANCE':
       updatePointsBalance(message.data);
       break;
@@ -411,6 +409,31 @@ async function updateCampaignProgress(data) {
   await persistSession();
 }
 
+// Prune campaigns the content script no longer reports as live (ended or no
+// longer returned by GQL), so the drops window reflects reality. Campaigns with
+// a drop claimed this session are kept so earned rewards stay visible.
+async function reconcileCampaigns(data) {
+  const session = await getSessionData();
+  // Only act on the active channel - ignore late snapshots from a previous one.
+  const incomingChannel = sanitizeString(data.channelName);
+  if (incomingChannel && session.activeChannel && incomingChannel !== session.activeChannel) return;
+
+  const liveIds = new Set((Array.isArray(data.liveIds) ? data.liveIds : []).map(sanitizeId).filter(Boolean));
+  let changed = false;
+  for (const [id, campaign] of Object.entries(session.drops || {})) {
+    if (liveIds.has(id)) continue;
+    const hasClaim = (campaign.drops || []).some(d => d.claimed);
+    if (hasClaim) continue;
+    delete session.drops[id];
+    changed = true;
+  }
+  if (changed) {
+    session.totalDropsThisSession = Object.values(session.drops)
+      .reduce((sum, c) => sum + (c.drops || []).filter(d => d.claimed).length, 0);
+    await persistSession();
+  }
+}
+
 async function recordDropClaim(data) {
   const session = await getSessionData();
   const campaignId = sanitizeId(data.campaignId);
@@ -512,40 +535,4 @@ async function setPollStatus(data) {
 
 async function resetSession() {
   await createNewSession();
-}
-
-// Relay a claim request to the content script in an open Twitch tab. The claim
-// GQL must originate from the www.twitch.tv page context (the extension/service
-// worker origin is rejected by Twitch), so we forward to each Twitch tab until
-// one reports success.
-async function claimDropViaContent(data) {
-  let tabs = [];
-  try {
-    tabs = await chrome.tabs.query({ url: '*://www.twitch.tv/*' });
-  } catch (err) {
-    return { ok: false, error: 'Could not query tabs: ' + (err?.message || err) };
-  }
-  if (!tabs.length) {
-    return { ok: false, error: 'No open Twitch tab - open twitch.tv to claim from here.' };
-  }
-
-  const payload = {
-    campaignId: sanitizeId(data.campaignId),
-    dropId: sanitizeId(data.dropId),
-    dropInstanceId: sanitizeInstanceId(data.dropInstanceId),
-    dropName: sanitizeString(data.dropName),
-  };
-
-  let lastError = 'No Twitch tab could claim this drop';
-  for (const tab of tabs) {
-    try {
-      const res = await chrome.tabs.sendMessage(tab.id, { type: 'CLAIM_DROP_REQUEST', data: payload });
-      if (res && res.ok) return { ok: true };
-      if (res && res.error) lastError = res.error;
-    } catch (err) {
-      // Tab without a live content script (e.g. still loading) - try the next.
-      lastError = err?.message || lastError;
-    }
-  }
-  return { ok: false, error: lastError };
 }

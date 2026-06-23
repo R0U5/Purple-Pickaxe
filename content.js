@@ -31,7 +31,6 @@ let lastIntegrityFetch = 0;
 // ── Module-level claimed state ──
 // Persist across scrape interval cycles; reset on channel change.
 const claimedDropIds = new Set();
-const claimedFallbackKeys = new Set();
 
 // ── Fix 9: Prevent concurrent fetchDropMetadata calls ──
 let fetchDropMetadataInFlight = false;
@@ -264,6 +263,13 @@ let claimState = {
   currentDropId: null,
 };
 
+// How long a drop may sit completed-but-unclaimed before we surface an error.
+// Auto-claim keeps retrying in the background; this only changes how it's shown
+// once it's clear claiming isn't succeeding (there is no manual claim button).
+const CLAIM_ERROR_MS = 120000;
+// dropId -> timestamp first seen complete & unclaimed. Drives the error state.
+const completeSince = new Map();
+
 function canAttemptClaim(dropId) {
   const now = Date.now();
   if (claimState.inProgress) return false;
@@ -332,6 +338,7 @@ function buildCampaignState(cached) {
 
     if (isClaimed) {
       drops[i].progress = 100;
+      completeSince.delete(drops[i].id);
       if (thisSessionClaimed) {
         drops[i].claimed = true;
         drops[i].status = 'claimed';
@@ -346,7 +353,17 @@ function buildCampaignState(cached) {
 
   if (firstUnclaimed >= 0) {
     const active = drops[firstUnclaimed];
-    active.status = active.progress >= 100 ? 'complete' : 'active';
+    if (active.progress >= 100) {
+      // Completed but not yet claimed. Auto-claim (DOM + inventory paths) keeps
+      // trying; if it can't succeed within CLAIM_ERROR_MS, show an error rather
+      // than a perpetual "ready" state, since there's no manual claim button.
+      if (!completeSince.has(active.id)) completeSince.set(active.id, Date.now());
+      const waited = Date.now() - completeSince.get(active.id);
+      active.status = waited > CLAIM_ERROR_MS ? 'claim_error' : 'complete';
+    } else {
+      active.status = 'active';
+      completeSince.delete(active.id);
+    }
   }
 
   // Cumulative campaign: top tier defines completion; watched minutes are shared across tiers.
@@ -367,65 +384,8 @@ function buildCampaignState(cached) {
   };
 }
 
-// ── DOM progress scraper ──
-// Reads what Twitch actually displays, used when GQL shows 0 but DOM shows real progress.
-function scrapeDomDropProgress(container) {
-  if (!container) return null;
-
-  // Strategy 1: aria progressbar (standard Twitch widget)
-  const bar = container.querySelector('[role="progressbar"]');
-  if (bar) {
-    const vn = parseInt(bar.getAttribute('aria-valuenow'), 10);
-    const vm = parseInt(bar.getAttribute('aria-valuemax'), 10);
-    if (!isNaN(vn) && !isNaN(vm) && vm > 0) {
-      return { current: vn, max: vm, percent: Math.round((vn / vm) * 100) };
-    }
-  }
-
-  // Strategy 2: percentage text (e.g. "80% complete", "75% of")
-  const text = (container.innerText || '').replace(/[\u200B-\u200D\uFEFF]/g, '');
-  const pctMatch = text.match(/(\d+)%/);
-  if (pctMatch) {
-    return { percent: parseInt(pctMatch[1], 10) };
-  }
-
-  // Strategy 3: fraction text (e.g. "48 / 60 minutes")
-  const fracMatch = text.match(/(\d+)\s*\/\s*(\d+)\s*(?:min|hr|hour)/i);
-  if (fracMatch) {
-    const cur = parseInt(fracMatch[1], 10);
-    const max = parseInt(fracMatch[2], 10);
-    if (max > 0) return { current: cur, max: max, percent: Math.round((cur / max) * 100) };
-  }
-
-  return null;
-}
-
 function normalizeCampaign(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '');
-}
-
-// ── Strict campaign matching ──
-// Contains + length-diff ≤ 6 gate. Multiple candidates → closest by character
-// difference, or null if tied.
-function matchCampaign(domKey, cache) {
-  if (!domKey) return null;
-  if (cache[domKey]) return cache[domKey];
-
-  const candidates = [];
-  for (const [key, val] of Object.entries(cache)) {
-    if ((key.includes(domKey) || domKey.includes(key)) &&
-        Math.abs(key.length - domKey.length) <= 6) {
-      candidates.push({ key, val, diff: Math.abs(key.length - domKey.length) });
-    }
-  }
-
-  if (candidates.length === 0) return null;
-  if (candidates.length === 1) return candidates[0].val;
-
-  // Multiple candidates - return closest by character difference, or null if tied
-  candidates.sort((a, b) => a.diff - b.diff);
-  if (candidates[0].diff === candidates[1].diff) return null;
-  return candidates[0].val;
 }
 
 // ── Fetch drop metadata via GQL ──
@@ -457,9 +417,6 @@ async function fetchDropMetadata(channelName) {
       return;
     }
 
-    // Fix 4: CLEAR_DROPS removed from here - setActiveChannel atomic clear
-    // handles the stale dom-* orphan problem.
-
     dropCache = {};
     dropCacheChannel = channelName;
     dropCacheTime = Date.now();
@@ -480,6 +437,7 @@ async function fetchDropMetadata(channelName) {
       dropCache[key] = {
         id: c.id,
         name: c.name,
+        endAt: c.endAt || null,
         gameName: c.game?.displayName || '',
         gameImage: c.game?.boxArtURL || '',
         drops: liveDrops.map(d => {
@@ -541,14 +499,10 @@ async function fetchInventory() {
 function restoreClaimedFlags() {
   chrome.runtime.sendMessage({ type: 'GET_SESSION' }, (response) => {
     if (!response?.drops) return;
-    for (const [campaignId, campaign] of Object.entries(response.drops)) {
+    for (const campaign of Object.values(response.drops)) {
       // Restore claimed flags for individual drops
       for (const drop of (campaign.drops || [])) {
         if (drop.claimed) claimedDropIds.add(drop.id);
-      }
-      // Restore fallback-claimed flag for campaigns with dom-* IDs
-      if (campaignId.startsWith('dom-') && campaign.drops?.some(d => d.claimed)) {
-        claimedFallbackKeys.add(campaignId.slice(4));
       }
     }
   });
@@ -773,78 +727,6 @@ async function claimDrop(dropInstanceId) {
   return { ok: false, error: lastErr };
 }
 
-// ── Claim-on-demand handler (popup "Claim" button) ──
-// Runs in the page context. Prefers the GQL claim using the inventory
-// dropInstanceID; falls back to clicking a visible DOM claim button when no
-// instance id is available (e.g. DOM-fallback campaigns).
-async function handleClaimDropRequest(data = {}) {
-  const dropId = typeof data.dropId === 'string' ? data.dropId : '';
-  let instanceId = typeof data.dropInstanceId === 'string' ? data.dropInstanceId : '';
-  if (!dropId && !instanceId) return { ok: false, error: 'Missing drop identifier' };
-
-  // If the popup had no synced instance id, pull a fresh inventory so we can
-  // claim via GQL instead of relying on a visible DOM button.
-  if (!instanceId && dropId) {
-    inventoryFetchTime = 0;
-    await fetchInventory();
-    instanceId = inventoryProgress[dropId]?.instanceId || '';
-  }
-
-  // Primary path: GQL claim with the inventory instance id.
-  if (instanceId) {
-    const res = await claimDrop(instanceId);
-    if (res.ok) {
-      if (dropId) claimedDropIds.add(dropId);
-      sendMessage('DROP_CLAIMED', {
-        campaignId: data.campaignId,
-        dropId: dropId || instanceId,
-        dropName: data.dropName || '',
-        gameImage: '',
-        dropImage: '',
-      });
-      // Force a fresh inventory pull on the next scan so isClaimed/progress sync.
-      inventoryFetchTime = 0;
-      return { ok: true };
-    }
-    // Fall through to DOM click if GQL didn't take.
-  }
-
-  // Fallback path: click a visible "claim" button if one is on the page.
-  const domContainer = document.querySelector('.community-highlight') || document.body;
-  const buttons = domContainer.querySelectorAll('button:not([disabled])');
-  for (const btn of buttons) {
-    const txt = (btn.textContent || '').toLowerCase();
-    const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-    if ((txt.includes('claim') || aria.includes('claim')) && btn.offsetParent !== null) {
-      btn.click();
-      if (dropId) claimedDropIds.add(dropId);
-      sendMessage('DROP_CLAIMED', {
-        campaignId: data.campaignId,
-        dropId: dropId || instanceId,
-        dropName: data.dropName || '',
-        gameImage: '',
-        dropImage: '',
-      });
-      inventoryFetchTime = 0;
-      return { ok: true };
-    }
-  }
-
-  return { ok: false, error: instanceId
-    ? 'Claim was not accepted by Twitch - try the inventory page'
-    : 'No claimable instance found yet - open inventory or wait for the next sync' };
-}
-
-// Receive claim-on-demand requests relayed from the popup via the background.
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Only accept messages from this extension (popup/background relay).
-  if (sender.id !== chrome.runtime.id) return;
-  if (message?.type === 'CLAIM_DROP_REQUEST') {
-    handleClaimDropRequest(message.data).then(sendResponse);
-    return true; // async response
-  }
-});
-
 async function detectDropsFromDOM() {
   if (!isContextValid()) return;
   const pathParts = window.location.pathname.split('/').filter(Boolean);
@@ -867,6 +749,9 @@ async function detectDropsFromDOM() {
   const supplemented = [];
   if (hasCache) {
     for (const cached of Object.values(dropCache)) {
+      // Drop campaigns that ended mid-session, checked every scan so the window
+      // updates promptly instead of waiting for the next metadata refetch.
+      if (cached.endAt && !isNaN(Date.parse(cached.endAt)) && Date.parse(cached.endAt) <= Date.now()) continue;
       const campaign = buildCampaignState(cached);
       if (!campaign || !campaign.drops.length) continue;
 
@@ -897,6 +782,12 @@ async function detectDropsFromDOM() {
       })),
     });
   }
+
+  // ── Reconcile displayed campaigns with what's live ──
+  // Tell the background the full set of currently-live campaign ids so it can
+  // drop ones that ended or are no longer returned by GQL. Sent before the
+  // claim logic (which can early-return) so it runs every scan.
+  sendMessage('CAMPAIGN_SNAPSHOT', { liveIds: supplemented.map(c => c.id) });
 
   // ── Claim detection (debounced) ──
   // Do NOT early-return when the highlight banner is absent. GQL auto-claim
@@ -1015,73 +906,6 @@ async function detectDropsFromDOM() {
     }
     return;
   }
-
-  // Fallback: no GQL data - use DOM progress bar (requires the highlight DOM)
-  if (!hasCache && domContainer) {
-    const progressBar = domContainer.querySelector('[role="progressbar"].tw-progress-bar');
-    if (!progressBar) return;
-    const highlightEl = domContainer.querySelector('[class*="dropsHighlight"]');
-    const lines = (highlightEl?.innerText || '').split('\n').map(l => l.trim()).filter(Boolean);
-    const domName = lines[1] || lines[0] || '';
-    const domKey = normalizeCampaign(domName);
-
-    // Use claimedFallbackKeys Set instead of window flag
-    if (claimedFallbackKeys.has(domKey)) return;
-
-    const valuenow = parseInt(progressBar.getAttribute('aria-valuenow'), 10);
-    const valuemaxAttr = parseInt(progressBar.getAttribute('aria-valuemax'), 10);
-    const hasRealMax = !isNaN(valuemaxAttr) && valuemaxAttr > 0;
-    const valuemax = hasRealMax ? valuemaxAttr : 100;
-    if (!isNaN(valuenow) && valuemax > 0) {
-      const fallbackProgress = Math.min(100, Math.max(0, Math.round((valuenow / valuemax) * 100)));
-      const fallbackId = domKey ? 'dom-' + domKey.slice(0, 48) : 'dom-unknown';
-
-      // Twitch's drop progress bar reports watched/required MINUTES in its aria
-      // attributes. The downstream fields are in seconds, so convert. When
-      // aria-valuemax is absent we only have a percentage (valuemax defaulted to
-      // 100), so emit 0 for the absolute times and let the popup show % only
-      // rather than display a wrong duration like "60s" for an hour-long drop.
-      const reqSecs = hasRealMax ? valuemax * 60 : 0;
-      const curSecs = hasRealMax ? valuenow * 60 : 0;
-
-      sendMessage('CAMPAIGN_PROGRESS', {
-        campaignId: fallbackId,
-        campaignName: domName || 'Unknown Drop',
-        gameName: currentChannel || 'Unknown',
-        gameImage: '',
-        campaignProgress: fallbackProgress,
-        totalRequiredSeconds: reqSecs,
-        totalEarnedSeconds: curSecs,
-        activeDropIndex: 0,
-        drops: [{
-          id: fallbackId + '-drop0',
-          name: domName || 'Unknown Drop',
-          image: '',
-          requiredSeconds: reqSecs,
-          currentSeconds: curSecs,
-          progress: fallbackProgress,
-          status: fallbackProgress >= 100 ? 'complete' : 'active',
-        }],
-      });
-
-      if (claimBtn && canAttemptClaim(fallbackId + '-drop0')) {
-        claimState.inProgress = true;
-        console.log('[Twitch Miner] Drop ready - auto-claiming via DOM button (fallback)');
-        claimedFallbackKeys.add(domKey);
-        // 500ms delay before clicking
-        await new Promise(r => setTimeout(r, 500));
-        claimBtn.click();
-        sendMessage('DROP_CLAIMED', {
-          campaignId: fallbackId,
-          dropId: fallbackId + '-drop0',
-          dropName: domName || '',
-          gameImage: '',
-          dropImage: '',
-        });
-        recordClaimAttempt(fallbackId + '-drop0', true);
-      }
-    }
-  }
 }
 
 // ── Tab-focus reporting ──
@@ -1169,7 +993,7 @@ async function handleUrlChange() {
 
   // Clear claimed Sets synchronously before async repopulation
   claimedDropIds.clear();
-  claimedFallbackKeys.clear();
+  completeSince.clear();
   restoreClaimedFlags();
 
   // Leaving channel - stop polling and end the channel session
