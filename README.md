@@ -87,6 +87,9 @@ Required to:
 * Read Drop progress
 * Claim Drops
 
+
+[Get Purple Pickaxe Here](https://chromewebstore.google.com/detail/purple-pickaxe/dinncmkklpbdjmdanobobapdldefheei)
+
 ```
 
 ---
