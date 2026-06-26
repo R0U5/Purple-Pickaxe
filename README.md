@@ -1,4 +1,6 @@
-# [Get Purple Pickaxe Here](https://chromewebstore.google.com/detail/purple-pickaxe/dinncmkklpbdjmdanobobapdldefheei)
+# [Download Purple Pickaxe Here](https://chromewebstore.google.com/detail/purple-pickaxe/dinncmkklpbdjmdanobobapdldefheei)
+
+
 
 ![Purple Pickaxe](https://github.com/R0U5/Purple-Pickaxe/blob/master/pp1.png)
 ![Purple Pickaxe](https://github.com/R0U5/Purple-Pickaxe/blob/master/pp2.png)
