@@ -1,7 +1,3 @@
-# [Download Purple Pickaxe By Clicking Here](https://chromewebstore.google.com/detail/purple-pickaxe/dinncmkklpbdjmdanobobapdldefheei)
-
----
-
 ![Purple Pickaxe](https://github.com/R0U5/Purple-Pickaxe/blob/master/purplepickaxe1.png)
 ![Purple Pickaxe](https://github.com/R0U5/Purple-Pickaxe/blob/master/purplepickaxe2.png)
 
@@ -90,4 +86,6 @@ Required to:
 * Communicate with Twitch's GraphQL API
 * Read Drop progress
 * Claim Drops
+
+# [Download Purple Pickaxe By Clicking Here](https://chromewebstore.google.com/detail/purple-pickaxe/dinncmkklpbdjmdanobobapdldefheei)
 
